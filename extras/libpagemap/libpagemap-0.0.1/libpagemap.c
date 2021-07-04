@@ -73,11 +73,22 @@
 #define DEBUG 1
 #undef DEBUG
 
+#define _4K_ (4*1024)
+#define _2M_ (2*1024*1024)
+#define _1G_ (1*1024*1024*1024)
+#define ALIGN_UP(x, align)  ((x + align -1) & ~(align -1))
+#define ALIGN_DOWN(x, align)  (x & ~(align -1))
+
 /////// NON-USER STRUCTURES //////////////
 typedef struct proc_mapping {
     unsigned long start, end, offset;
-    unsigned long * pfns;
+    unsigned long *pfns;
     int perms;
+    int major, minor;
+    unsigned long ino;
+    char file[256];
+    uint16_t *_2M;
+    uint16_t *_1G;
     struct proc_mapping * next;
 } proc_mapping;
 
@@ -245,6 +256,10 @@ static void free_mappings(pagemap_list * tmp) {
     proc_mapping * next;
     while (tmp->pid_table.mappings) {
         next = tmp->pid_table.mappings->next;
+        if (tmp->pid_table.mappings->_2M)
+            free(tmp->pid_table.mappings->_2M);
+        if (tmp->pid_table.mappings->_1G)
+            free(tmp->pid_table.mappings->_1G);
         free(tmp->pid_table.mappings);
         tmp->pid_table.mappings = next;
     }
@@ -304,11 +319,13 @@ static int read_cmd(process_pagemap_t * p_t) {
     return OK;
 }
 
-static pagemap_tbl * fill_cmdlines(pagemap_tbl * table) {
+static pagemap_tbl * fill_cmdlines(pagemap_tbl * table, int pid) {
     pagemap_list * tmp;
 
     reset_pos(table);
     while ((tmp = pid_iter(table))) {
+        if (pid > 0 && tmp->pid_table.pid != pid)
+            continue;
         if (read_cmd(&(tmp->pid_table)) != OK)
             trace("read_cmd() error");
     }
@@ -335,11 +352,15 @@ static int read_maps(process_pagemap_t * p_t) {
             return ERROR;
         }
         memset(new, '\0', sizeof(*new));
-        sscanf(line,"%lx-%lx %5s %lx %*s %*d %*s",
+        sscanf(line,"%lx-%lx %5s %lx %x:%x %lu %s",
                 &new->start,
                 &new->end,
                 permiss,
-                &new->offset);
+                &new->offset,
+                &new->major,
+                &new->minor,
+                &new->ino,
+                new->file);
         if (!new->start || !new->end) {
             fclose(maps_fd);
             return ERROR;
@@ -355,6 +376,19 @@ static int read_maps(process_pagemap_t * p_t) {
         if (strchr(permiss,'s'))
             new->perms |= PERM_SHARE;
 
+        new->_2M = new->_1G = NULL;
+        if (new->end - new->start >= _2M_) {
+            unsigned long start_aligned, end_aligned;
+            start_aligned = ALIGN_DOWN(new->start, _2M_);
+            end_aligned = ALIGN_UP(new->end, _2M_);
+            new->_2M = calloc(sizeof(uint16_t), (end_aligned - start_aligned) / _2M_);
+            if (new->end - new->start >= _1G_) {
+                start_aligned = ALIGN_DOWN(new->start, _1G_);
+                end_aligned = ALIGN_UP(new->end, _1G_);
+                new->_1G = calloc(sizeof(uint16_t), (end_aligned - start_aligned) / _1G_);
+            }
+        }
+        
         if (!p_t->mappings)
             p_t->mappings = new;
         else {
@@ -368,11 +402,13 @@ static int read_maps(process_pagemap_t * p_t) {
     return OK;
 }
 
-static pagemap_tbl * fill_mappings(pagemap_tbl * table) {
+static pagemap_tbl * fill_mappings(pagemap_tbl * table, int pid) {
     pagemap_list * tmp;
 
     reset_pos(table);
     while ((tmp = pid_iter(table))) {
+        if (pid > 0 && tmp->pid_table.pid != pid)
+            continue;
         if (read_maps(&(tmp->pid_table)) != OK)
             trace("read_maps() error");
     }
@@ -471,6 +507,7 @@ static int walk_proc_mem(process_pagemap_t * p_t, pagemap_tbl * table) {
     char pagemap_p[sizeof("/proc/%d/pagemap") + sizeof(int)*3];
     off64_t lseek_ret;
     uint64_t datanum,pfn;
+    uint64_t start_aligned_2M, start_aligned_1G;
     double pss = 0.0;
 
     sprintf(pagemap_p,"/proc/%d/pagemap",p_t->pid);
@@ -508,6 +545,8 @@ static int walk_proc_mem(process_pagemap_t * p_t, pagemap_tbl * table) {
     p_t->n_recycle = 0;
 
     for (proc_mapping * cur = p_t->mappings; cur != NULL; cur = cur->next) {
+        start_aligned_2M = ALIGN_DOWN(cur->start, _2M_);
+        start_aligned_1G = ALIGN_DOWN(cur->start, _1G_);
         for (uint64_t addr = cur->start; addr < cur->end; addr += table->kpagemap->pagesize) {
             if ((lseek_ret = lseek64(pagemap_fd, (addr/table->kpagemap->pagesize)*8, SEEK_SET)) == (off64_t) -1) {
                 close(pagemap_fd);
@@ -530,7 +569,13 @@ static int walk_proc_mem(process_pagemap_t * p_t, pagemap_tbl * table) {
             }
             pfn = PM_PFRAME(datanum);
             p_t->res += 1;
-
+            if (cur->_2M) {
+                long pos_2M = (addr-start_aligned_2M)/_2M_;
+                long pos_1G = (addr-start_aligned_1G)/_1G_;
+                cur->_2M[pos_2M]++;
+                if (cur->_1G && cur->_2M[pos_2M] == (_2M_/_4K_))
+                    cur->_1G[pos_1G]++;
+            }
             if (table->kpagemap->under_root == 1) {
                 if (get_kpagecount(table, pfn ,&datanum) != OK)
                     return RD_ERROR;
@@ -687,9 +732,9 @@ pagemap_tbl * init_pgmap_table(pagemap_tbl * table) {
 }
 
 pagemap_tbl * open_pgmap_table(pagemap_tbl * table, int pid) {
-    fill_mappings(table);
+    fill_mappings(table,pid);
     trace("fill_mappings");
-    fill_cmdlines(table);
+    fill_cmdlines(table,pid);
     trace("fill_cmdlines");
     walk_procs(table,pid);
     trace("walk_procs");
@@ -700,6 +745,66 @@ void free_pgmap_table(pagemap_tbl * table) {
     clean_tables(table);
     trace("kill tables");
 }
+
+void print_resident_info(process_pagemap_t *p)
+{
+    proc_mapping *next = p->mappings;
+    while (next) {
+        printf("%lx-%lx %c%c%c%c%c %08lx %02x:%02x %-8lu %s\n", 
+                next->start,
+                next->end,
+                (next->perms & PERM_READ) ? 'r' : '-',
+                (next->perms & PERM_WRITE) ? 'w' : '-',
+                (next->perms & PERM_EXEC) ? 'x' : '-',
+                (next->perms & PERM_PRIV) ? 'p' : '-',
+                (next->perms & PERM_SHARE) ? 's' : '-',
+                next->offset,
+                next->major,
+                next->minor,
+                next->ino,
+                next->file);
+        if (next->_2M) {
+            int i, len;
+            unsigned long start_aligned, end_aligned;
+            start_aligned = ALIGN_DOWN(next->start, _2M_);
+            end_aligned = ALIGN_UP(next->end, _2M_);
+            len = (end_aligned - start_aligned) / _2M_;
+            printf("2M: ");
+            for (i=0; i<len; i++) {
+                if (next->_2M[i] >= _2M_/_4K_)
+                    printf("O");
+                else if (next->_2M[i] > _2M_/_4K_/2)
+                    printf("o");
+                else if (next->_2M[i] > 0)
+                    printf(".");
+                else
+                    printf("_");
+            }
+            printf("\n");
+        }
+        if (next->_1G) {
+            int i, len;
+            unsigned long start_aligned, end_aligned;
+            start_aligned = ALIGN_DOWN(next->start, _1G_);
+            end_aligned = ALIGN_UP(next->end, _1G_);
+            len = (end_aligned - start_aligned) / _1G_;
+            printf("1G: ");
+            for (i=0; i<len; i++) {
+                if (next->_1G[i] >= _1G_/_2M_)
+                    printf("O");
+                else if (next->_1G[i] > _1G_/_2M_/2)
+                    printf("o");
+                else if (next->_1G[i] > 0)
+                    printf(".");
+                else
+                    printf("_");
+            }
+            printf("\n");
+        }
+        next = next->next;
+    }
+}
+
 
 // must be used with initialised table
 process_pagemap_t * get_single_pgmap(pagemap_tbl * table, int pid)

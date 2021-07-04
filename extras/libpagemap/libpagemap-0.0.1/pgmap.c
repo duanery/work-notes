@@ -42,7 +42,8 @@
                       "\t -F :prints info from kpageflags file\n"\
                       "\t -P pid :prints only specified pid\n"\
                       "\t -s [uss|pss|shr|res|swap|pid][+-] :sort by given stat\n"\
-                      "\t -c :prints in csv format\n"
+                      "\t -c :prints in csv format\n"\
+                      "\t -r :prints resident info in 2M & 1G\n"
 #define BUFFSIZE       128
 
 #define DEF_PRINT(item) \
@@ -182,6 +183,7 @@ static int F_arg; // prints flag stuff too
 static int P_arg; // filter pid with argument
 static int s_arg; // sort results
 static int c_arg; // csv form
+static int r_arg; // 2M and 1G
 static int filter_pid; // pid, which only be shown
 static char sort_id[BUFFSIZE]; // for sort option
 static int (*sort_func)(process_pagemap_t **, process_pagemap_t **); //pointer to sorting function
@@ -215,7 +217,7 @@ static int parse_args(int argc, char * argv[])
         P_arg = 0;
         s_arg = 0;
     } else {
-        while((opt = getopt(argc,argv,"hncdFpP:s:")) != -1) {
+        while((opt = getopt(argc,argv,"hncdFprP:s:")) != -1) {
             switch (opt) {
                 case 'n':
                     n_arg = 1;
@@ -234,6 +236,9 @@ static int parse_args(int argc, char * argv[])
                     break;
                 case 'c':
                     c_arg = 1;
+                    break;
+                case 'r':
+                    r_arg = 1;
                     break;
                 case 'P':
                     P_arg = 1;
@@ -492,6 +497,9 @@ int main(int argc, char * argv[])
             if (!d_arg)
                 print_row(NULL,hlist);
         print_row(one_tab,hlist);
+        if (r_arg) {
+            print_resident_info(one_tab);
+        }
     }
 
     //release sources

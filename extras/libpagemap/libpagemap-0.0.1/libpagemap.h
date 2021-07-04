@@ -88,6 +88,9 @@ pagemap_tbl * open_pgmap_table(pagemap_tbl * table, int pid);
 // close pagemap tables and free them
 void free_pgmap_table(pagemap_tbl * table);
 
+// print proc mapping resident info, 2M, 1G
+void print_resident_info(process_pagemap_t *p);
+
 // return single pagemap table for one pid - AD-HOC
 process_pagemap_t * get_single_pgmap(pagemap_tbl * table, int pid);
 
