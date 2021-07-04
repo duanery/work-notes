@@ -1,0 +1,440 @@
+#!/usr/bin/env python
+
+# pagemapvisual - tool for graphical representation of pagemap interface
+# Copyright (C) 2010 Red Hat, Inc. All rights reserved.
+#
+#     This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Author: Petr Holasek , pholasek@redhat.com
+
+import os
+import sys
+import array
+import time
+import argparse
+import struct
+import pagemapdata
+import matplotlib
+from pylab import *
+import numpy.numarray as na
+from operator import itemgetter
+
+# TODO: 
+#      Pageflags stuff
+#      ------------ next release
+#      Wedges value label
+#      Show grid ?
+#      Status bar of processing?
+#      Show filter and limit settings
+#            Threads on backgroud? 
+# Type of graphs:
+#   count * pie chart - percentage of shared pages (0-6%,1-80%..)
+#         * bar chart - percentage of shared pages (0-6%,1-80%..)
+#   flags * bar chart - percentage of used flags (buddy-6%,slab-80%..) NOT IMPLEMENT
+#         * pie char  - percentage of memory with selected flag for processes NOT IMPLEMENT
+#   pagemap * pie chart(s) - percentage by processes by every statistics (USS,PSS,SWAP,SHARE,RES)
+
+
+
+COUNT = 1
+FLAGS = 2
+PGMAP = 3
+
+BAR   = 4
+PIE   = 5
+CSV   = 13
+
+PID   = 6
+NAME  = 7
+
+USS   = 8
+PSS   = 9
+SWAP  = 10
+RES   = 11
+SHR   = 12
+
+parser = argparse.ArgumentParser()
+parser.add_argument('source', choices=['pagecount','pageflags','pagemap'],help='source of data')
+parser.add_argument('type', choices=['bar','pie','csv'], help='type of chart')
+parser.add_argument('--stat', nargs='?', const='uss', default='uss', help='type of statistics to plot STAT=[uss|pss|shr|swap|res] uss is default')
+parser.add_argument('--label', nargs='?', const='name', default='name', help='type of label on pagemap statistics LABEL=[name|pid]')
+parser.add_argument('--filtery', nargs='?', const='', default='', help='filter used for y-axis values FILTERY=[[from]:[to]]')
+parser.add_argument('--logy', action='store_true', help='enable log scale on y-axis')
+parser.add_argument('--limity', nargs='?', const=0, type=int, default=0, help='eliminates results to first/last y-values LIMITY=[[+|-]NUMBER]')
+
+
+class RuntimeError(Exception):
+    '''
+    Base error class
+    '''
+    pass
+
+
+class Painter:
+    '''
+    Class which invoke gtk paintings of pgmap_data class to Window
+    '''
+
+    def __init__(self,args):
+        self.args = args
+        try:
+            self.pagemap = pagemapdata.PagemapData()
+        except pagemapdata.NoPagemapError:
+            sys.exit("No access to pagemap interface.Exit.")
+        if args.source == 'pagecount':
+            self.s_src = COUNT
+            self.texttitle = 'Number of page shares'
+        elif args.source == 'pageflags':
+            self.s_src = FLAGS
+            self.texttitle = 'Number of pages with this flags'
+        elif args.source == 'pagemap':
+            self.s_src = PGMAP
+        else:
+            self.s_type = -1 # should never happen
+
+        if args.logy == True:
+            self.logar = True
+        else:
+            self.logar = False
+
+        if args.type == 'bar':
+            self.s_type = BAR
+        elif args.type == 'pie':
+            self.s_type = PIE
+        elif args.type == 'csv':
+            self.s_type = CSV
+        else:
+            self.s_type = -1 # should never happen
+
+        if args.label == 'name':
+            self.l_type = NAME
+        elif args.label == 'pid':
+            self.l_type = PID
+        else:
+            self.s_type = NAME # should never happen
+
+        if args.limity == '':
+            self.limit = 0
+        else:
+            self.limit = args.limity
+
+        if self.s_src == PGMAP:
+            if args.stat == 'uss':
+                self.p_type = USS
+                self.texttitle = 'USS of system processes'
+            elif args.stat == 'pss':
+                self.p_type = PSS
+                self.texttitle = 'PSS of system processes'
+            elif args.stat == 'shr':
+                self.p_type = SHR
+                self.texttitle = 'SHR of system processes'
+            elif args.stat == 'swap':
+                self.p_type = SWAP
+                self.texttitle = 'SWAP of system processes'
+            elif args.stat == 'res':
+                self.p_type = RES
+                self.texttitle = 'RES of system processes'
+            else:
+                self.p_type = USS # should never happen
+                self.texttitle = 'USS of system processes'
+
+            self.texttitle = ''.join([self.texttitle,' in kB'])
+
+        if self.logar:
+            self.texttitle = ''.join([self.texttitle,',log axis: True '])
+        if self.limit != 0:
+            self.texttitle = ''.join([self.texttitle,',limit = ',str(self.limit),' '])
+        if self.args.filtery != '':
+            self.texttitle = ''.join([self.texttitle, ',filter = ', self.args.filtery])
+
+        self.source_switch = {
+                               COUNT : self.prepare_count,
+                               FLAGS : self.prepare_flags,
+                               PGMAP : self.prepare_pagemap
+                             }
+        self.type_switch = {
+                             BAR : self.draw_bar,
+                             PIE : self.draw_pie,
+                             CSV : self.write_csv
+                           }
+
+        self.p_data = {}
+
+    def prepare_count(self):
+        '''
+        Make dictionary from kpgacount values
+        '''
+        self.p_data = {}
+        pgcount = p.pagemap.get_pagecount()
+        p.pagemap.fill_count()
+        for i in range(pgcount):
+            pos = i*8
+            try:
+                cnt = self.pagemap.kpagecount[pos:pos+8]
+            except:
+                cnt = '\0'*8
+            c = struct.unpack("Q", cnt)[0]
+
+            try:
+                self.p_data[c] += 1
+            except KeyError:
+                self.p_data[c] = 1
+
+
+    def prepare_flags(self):
+        '''
+        Make dictionary for all types of values
+        '''
+        self.p_data = {}
+        pcount = p.pagemap.get_pagecount()
+        p.pagemap.fill_flags()
+        # initialization of data dict
+        self.p_data["drt"] = 0
+        self.p_data["uptd"] = 0
+        self.p_data["wback"] = 0
+        self.p_data["err"] = 0
+        self.p_data["lck"] = 0
+        self.p_data["slab"] = 0
+        self.p_data["buddy"] = 0
+        self.p_data["cmpndh"] = 0
+        self.p_data["cmpndt"] = 0
+        self.p_data["ksm"] = 0
+        self.p_data["hwpois"] = 0
+        self.p_data["huge"] = 0
+        self.p_data["npage"] = 0
+        self.p_data["mmap"] = 0
+        self.p_data["anon"] = 0
+        self.p_data["swpche"] = 0
+        self.p_data["swpbck"] = 0
+        self.p_data["onlru"] = 0
+        self.p_data["actlru"] = 0
+        self.p_data["unevctb"] = 0
+        self.p_data["referenced"] = 0
+        self.p_data["recycle"] = 0
+
+        for i in range(pcount):
+            pos = i*8
+            try:
+                flg = self.pagemap.kpageflags[pos:pos+8]
+            except:
+                flg = '\0'*8
+            f = struct.unpack("Q", flg)[0]
+            # comparing values - same as in libpagemap
+            if f & 1L << 4:
+                self.p_data["drt"] += 1
+            if f & 1L << 3:
+                self.p_data["uptd"] += 1
+            if f & 1L << 8:
+                self.p_data["wback"] += 1
+            if f & 1L << 1:
+                self.p_data["err"] += 1
+            if f & 1L << 0:
+                self.p_data["lck"] += 1
+            if f & 1L << 7:
+                self.p_data["slab"] += 1
+            if f & 1L << 10:
+                self.p_data["buddy"] += 1
+            if f & 1L << 15:
+                self.p_data["cmpndh"] += 1
+            if f & 1L << 16:
+                self.p_data["cmpndt"] += 1
+            if f & 1L << 21:
+                self.p_data["ksm"] += 1
+            if f & 1L << 19:
+                self.p_data["hwpois"] += 1
+            if f & 1L << 16:
+                self.p_data["huge"] += 1
+            if f & 1L << 20:
+                self.p_data["npage"] += 1
+            if f & 1L << 11:
+                self.p_data["mmap"] += 1
+            if f & 1L << 12:
+                self.p_data["anon"] += 1
+            if f & 1L << 13:
+                self.p_data["swpche"] += 1
+            if f & 1L << 14:
+                self.p_data["swpbck"] += 1
+            if f & 1L << 5:
+                self.p_data["onlru"] += 1
+            if f & 1L << 6:
+                self.p_data["actlru"] += 1
+            if f & 1L << 18:
+                self.p_data["unevctb"] += 1
+            if f & 1L << 2:
+                self.p_data["referenced"] += 1
+            if f & 1L << 9:
+                self.p_data["recycle"] += 1
+
+        # clean zeros
+        for i in self.p_data.keys():
+            if self.p_data[i] == 0:
+                del self.p_data[i]
+        
+    def prepare_pagemap(self):
+        self.p_data = {}
+        p.pagemap.refresh_pids()
+        p.pagemap.refresh_pgmap()
+        # fill self.p_data due requested value
+        for k, v in p.pagemap.kpagemap.items():
+            if self.l_type == NAME:
+                label_key = v[5]
+            elif self.l_type == PID:
+                label_key = k
+
+            #uss
+            if self.p_type == USS:
+                self.p_data[label_key] = v[0]
+            elif self.p_type == PSS:
+                self.p_data[label_key] = v[1]
+            elif self.p_type == SHR:
+                self.p_data[label_key] = v[2]
+            elif self.p_type == RES:
+                self.p_data[label_key] = v[3]
+            elif self.p_type == SWAP:
+                self.p_data[label_key] = v[4]
+
+         
+    def draw_bar(self):
+        '''
+        Plots bar graph
+        '''
+        width = 0.2
+        #figure(1, figsize=(6,6))
+        #ax = axes([0.1, 0.1, 0.8, 0.8])
+        xlocations = na.array(range(len(self.p_data.keys())))
+        xlocations_t = na.array(range(1,len(self.p_data.keys())+1))
+
+        bar(xlocations, self.p_data.values(), log=self.logar)
+        title(self.texttitle, bbox={'facecolor':'0.8', 'pad':5})
+        captions = self.p_data.keys()
+        # pageflags are translated into more understoodable form
+        if FLAGS:
+            pass
+        if self.s_src == PGMAP or self.s_src == FLAGS:
+            xticks(xlocations_t, captions,rotation='vertical') # for big charts
+        else:
+            xticks(xlocations, captions) # for big charts
+        show()
+ 
+    def draw_pie(self):
+        '''
+        Plots pie graph
+        '''
+        figure(1, figsize=(6,6))
+        ax = axes([0.1, 0.1, 0.8, 0.8])
+        labels=[]
+        for k, v in self.p_data.items():
+            labels.append(' '.join([str(k),str(v)]))
+        chart = pie(self.p_data.values(),labels=labels, shadow=False, autopct='')
+
+        title(self.texttitle, bbox={'facecolor':'0.8', 'pad':5})
+
+        show()
+
+    def write_csv(self):
+        '''
+        Write output as CSV format
+        '''
+        if self.s_src == FLAGS:
+            print "flag,pages"
+        elif self.s_src == COUNT:
+            print "mapcount,pages"
+        elif self.s_src == PGMAP:
+            print ''.join([args.label,',',args.stat]) 
+
+        for k,v in self.p_data.items():
+            print "%s,%s" % (k,v)
+
+    def filter_parse(self, filter_str):
+        '''
+        Method parses given filter values
+        '''
+        if filter_str != '':
+            values = filter_str.split(':')
+        else:
+            values = ''
+            minim, maxim =  None, None
+        if len(values) != 2:
+            minim, maxim =  None, None
+        else:
+            if values[0] == '':
+                minim = None
+            else:
+                try:
+                    minim = int(values[0])
+                except:
+                    minim = None
+            if values[1] == '':
+                maxim = None
+            else:
+                try:
+                    maxim = int(values[1])
+                except:
+                    maxim = None
+        if minim and maxim and minim > maxim:
+            return None, None
+        return minim, maxim
+
+    def filter_values(self):
+        '''
+        Method filters values to plot in order of given filter values
+        '''
+        minim_y, maxim_y = self.filter_parse(self.args.filtery)
+        for k in self.p_data.keys():
+            if minim_y:
+                if self.p_data[k] < minim_y:
+                    del self.p_data[k]
+                    continue
+            if maxim_y:
+                if self.p_data[k] > maxim_y:
+                    del self.p_data[k]
+
+    def limit_values(self):
+        '''
+        Eliminates number of results in graph to given limit
+        '''
+        if self.limit != 0:
+            out_of_limit = sorted(self.p_data.items(), key=itemgetter(1), reverse=True)
+            if self.limit > 0:
+                out_of_limit = out_of_limit[self.limit:]
+            else:
+                out_of_limit = out_of_limit[:self.limit]
+            for k,v in out_of_limit:
+                if k in self.p_data:
+                    del self.p_data[k]
+
+    def run_plot(self):
+        '''
+        Core method which starts data prepare and plot
+        '''
+        #print 'Preparing data . . .'
+        self.source_switch.get(self.s_src, 1)()
+        self.filter_values()
+        self.limit_values()
+        #print 'Ploting data . . .'
+        self.type_switch.get(self.s_type, 1)()
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    p = Painter(args)
+    p.run_plot()
+
+
+
+    
+
+    
+    
+
