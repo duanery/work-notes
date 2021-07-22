@@ -7,6 +7,7 @@
  * Copyright (C) Shailabh Nagar, IBM Corp. 2005
  * Copyright (C) Balbir Singh, IBM Corp. 2006
  * Copyright (c) Jay Lan, SGI. 2006
+ * Copyright (c) duanery 2021
  *
  * Compile with
  *	gcc -I/usr/src/linux/include getdelays.c -o getdelays
@@ -39,6 +40,8 @@
 #define NLA_DATA(na)		((void *)((char*)(na) + NLA_HDRLEN))
 #define NLA_PAYLOAD(len)	(len - NLA_HDRLEN)
 
+#define MB (1024*1024)
+
 #define err(code, fmt, arg...)			\
 	do {					\
 		fprintf(stderr, fmt, ##arg);	\
@@ -49,9 +52,8 @@ int done;
 int rcvbufsz;
 char name[100];
 int dbg;
-int print_delays;
 int print_io_accounting;
-int print_task_context_switch_counts;
+int print_mem_accounting;
 
 #define PRINTF(fmt, arg...) {			\
 	    if (dbg) {				\
@@ -71,17 +73,6 @@ struct msgtemplate {
 };
 
 char cpumask[100+6*MAX_CPUS];
-
-static void usage(void)
-{
-	fprintf(stderr, "getdelays [-dilv] [-w logfile] [-r bufsize] "
-			"[-m cpumask] [-t tgid] [-p pid]\n");
-	fprintf(stderr, "  -d: print delayacct stats\n");
-	fprintf(stderr, "  -i: print IO accounting (works only with -p)\n");
-	fprintf(stderr, "  -l: listen forever\n");
-	fprintf(stderr, "  -v: debug on\n");
-	fprintf(stderr, "  -C: container path\n");
-}
 
 /*
  * Create a raw netlink socket and bind
@@ -192,52 +183,276 @@ static int get_family_id(int sd)
 	return id;
 }
 
-#define average_ms(t, c) (t / 1000000ULL / (c ? c : 1))
+#if 0
 
-static void print_delayacct(struct taskstats *t)
+#define TASKSTATS_VERSION	10
+#define TS_COMM_LEN		32	/* should be >= TASK_COMM_LEN
+					 * in linux/sched.h */
+
+struct taskstats {
+
+	/* The version number of this struct. This field is always set to
+	 * TAKSTATS_VERSION, which is defined in <linux/taskstats.h>.
+	 * Each time the struct is changed, the value should be incremented.
+	 */
+	__u16	version;
+	__u32	ac_exitcode;		/* Exit status */
+
+	/* The accounting flags of a task as defined in <linux/acct.h>
+	 * Defined values are AFORK, ASU, ACOMPAT, ACORE, and AXSIG.
+	 */
+	__u8	ac_flag;		/* Record flags */
+	__u8	ac_nice;		/* task_nice */
+
+	/* Delay accounting fields start
+	 *
+	 * All values, until comment "Delay accounting fields end" are
+	 * available only if delay accounting is enabled, even though the last
+	 * few fields are not delays
+	 *
+	 * xxx_count is the number of delay values recorded
+	 * xxx_delay_total is the corresponding cumulative delay in nanoseconds
+	 *
+	 * xxx_delay_total wraps around to zero on overflow
+	 * xxx_count incremented regardless of overflow
+	 */
+
+	/* Delay waiting for cpu, while runnable
+	 * count, delay_total NOT updated atomically
+	 */
+	__u64	cpu_count __attribute__((aligned(8)));
+	__u64	cpu_delay_total;
+
+	/* Following four fields atomically updated using task->delays->lock */
+
+	/* Delay waiting for synchronous block I/O to complete
+	 * does not account for delays in I/O submission
+	 */
+	__u64	blkio_count;
+	__u64	blkio_delay_total;
+
+	/* Delay waiting for page fault I/O (swap in only) */
+	__u64	swapin_count;
+	__u64	swapin_delay_total;
+
+	/* cpu "wall-clock" running time
+	 * On some architectures, value will adjust for cpu time stolen
+	 * from the kernel in involuntary waits due to virtualization.
+	 * Value is cumulative, in nanoseconds, without a corresponding count
+	 * and wraps around to zero silently on overflow
+	 */
+	__u64	cpu_run_real_total;
+
+	/* cpu "virtual" running time
+	 * Uses time intervals seen by the kernel i.e. no adjustment
+	 * for kernel's involuntary waits due to virtualization.
+	 * Value is cumulative, in nanoseconds, without a corresponding count
+	 * and wraps around to zero silently on overflow
+	 */
+	__u64	cpu_run_virtual_total;
+	/* Delay accounting fields end */
+	/* version 1 ends here */
+
+	/* Basic Accounting Fields start */
+	char	ac_comm[TS_COMM_LEN];	/* Command name */
+	__u8	ac_sched __attribute__((aligned(8)));
+					/* Scheduling discipline */
+	__u8	ac_pad[3];
+	__u32	ac_uid __attribute__((aligned(8)));
+					/* User ID */
+	__u32	ac_gid;			/* Group ID */
+	__u32	ac_pid;			/* Process ID */
+	__u32	ac_ppid;		/* Parent process ID */
+	/* __u32 range means times from 1970 to 2106 */
+	__u32	ac_btime;		/* Begin time [sec since 1970] */
+	__u64	ac_etime __attribute__((aligned(8)));
+					/* Elapsed time [usec] */
+	__u64	ac_utime;		/* User CPU time [usec] */
+	__u64	ac_stime;		/* SYstem CPU time [usec] */
+	__u64	ac_minflt;		/* Minor Page Fault Count */
+	__u64	ac_majflt;		/* Major Page Fault Count */
+	/* Basic Accounting Fields end */
+
+	/* Extended accounting fields start */
+	/* Accumulated RSS usage in duration of a task, in MBytes-usecs.
+	 * The current rss usage is added to this counter every time
+	 * a tick is charged to a task's system time. So, at the end we
+	 * will have memory usage multiplied by system time. Thus an
+	 * average usage per system time unit can be calculated.
+	 */
+	__u64	coremem;		/* accumulated RSS usage in MB-usec */
+	/* Accumulated virtual memory usage in duration of a task.
+	 * Same as acct_rss_mem1 above except that we keep track of VM usage.
+	 */
+	__u64	virtmem;		/* accumulated VM  usage in MB-usec */
+
+	/* High watermark of RSS and virtual memory usage in duration of
+	 * a task, in KBytes.
+	 */
+	__u64	hiwater_rss;		/* High-watermark of RSS usage, in KB */
+	__u64	hiwater_vm;		/* High-water VM usage, in KB */
+
+	/* The following four fields are I/O statistics of a task. */
+	__u64	read_char;		/* bytes read */
+	__u64	write_char;		/* bytes written */
+	__u64	read_syscalls;		/* read syscalls */
+	__u64	write_syscalls;		/* write syscalls */
+	/* Extended accounting fields end */
+
+#define TASKSTATS_HAS_IO_ACCOUNTING
+	/* Per-task storage I/O accounting starts */
+	__u64	read_bytes;		/* bytes of read I/O */
+	__u64	write_bytes;		/* bytes of write I/O */
+	__u64	cancelled_write_bytes;	/* bytes of cancelled write I/O */
+
+	__u64  nvcsw;			/* voluntary_ctxt_switches */
+	__u64  nivcsw;			/* nonvoluntary_ctxt_switches */
+
+	/* time accounting for SMT machines */
+	__u64	ac_utimescaled;		/* utime scaled on frequency etc */
+	__u64	ac_stimescaled;		/* stime scaled on frequency etc */
+	__u64	cpu_scaled_run_real_total; /* scaled cpu_run_real_total */
+
+	/* Delay waiting for memory reclaim */
+	__u64	freepages_count;
+	__u64	freepages_delay_total;
+
+	/* Delay waiting for thrashing page */
+	__u64	thrashing_count;
+	__u64	thrashing_delay_total;
+
+	/* v10: 64-bit btime to avoid overflow */
+	__u64	ac_btime64;		/* 64-bit begin time */
+};
+
+#endif
+
+
+// dst = src2 - src1
+#define SUB(x) \
+    if (src2->x >= src1->x) \
+        dst->x = src2->x - src1->x; \
+    else \
+        dst->x = 0;
+void taskstats_sub(struct taskstats *dst, struct taskstats *src1, struct taskstats *src2)
 {
-	printf("\n\nCPU   %15s%15s%15s%15s%15s\n"
-	       "      %15llu%15llu%15llu%15llu%15.3fms\n"
-	       "IO    %15s%15s%15s\n"
-	       "      %15llu%15llu%15llums\n"
-	       "SWAP  %15s%15s%15s\n"
-	       "      %15llu%15llu%15llums\n"
-	       "RECLAIM  %12s%15s%15s\n"
-	       "      %15llu%15llu%15llums\n"
-	       "THRASHING%12s%15s%15s\n"
-	       "      %15llu%15llu%15llums\n",
-	       "count", "real total", "virtual total",
-	       "delay total", "delay average",
-	       (unsigned long long)t->cpu_count,
-	       (unsigned long long)t->cpu_run_real_total,
-	       (unsigned long long)t->cpu_run_virtual_total,
-	       (unsigned long long)t->cpu_delay_total,
-	       average_ms((double)t->cpu_delay_total, t->cpu_count),
-	       "count", "delay total", "delay average",
-	       (unsigned long long)t->blkio_count,
-	       (unsigned long long)t->blkio_delay_total,
-	       average_ms(t->blkio_delay_total, t->blkio_count),
-	       "count", "delay total", "delay average",
-	       (unsigned long long)t->swapin_count,
-	       (unsigned long long)t->swapin_delay_total,
-	       average_ms(t->swapin_delay_total, t->swapin_count),
-	       "count", "delay total", "delay average",
-	       (unsigned long long)t->freepages_count,
-	       (unsigned long long)t->freepages_delay_total,
-	       average_ms(t->freepages_delay_total, t->freepages_count),
-	       "count", "delay total", "delay average",
-	       (unsigned long long)t->thrashing_count,
-	       (unsigned long long)t->thrashing_delay_total,
-	       average_ms(t->thrashing_delay_total, t->thrashing_count));
+    memcpy(dst, src2, sizeof(struct taskstats));
+    SUB(cpu_count);
+    SUB(cpu_delay_total);
+    SUB(blkio_count);
+    SUB(blkio_delay_total);
+    SUB(swapin_count);
+    SUB(swapin_delay_total);
+    SUB(cpu_run_real_total);
+    SUB(cpu_run_virtual_total);
+    SUB(ac_utime);
+    SUB(ac_stime);
+    SUB(ac_minflt);
+    SUB(ac_majflt);
+    SUB(read_char);
+    SUB(write_char);
+    SUB(read_syscalls);
+    SUB(write_syscalls);
+    SUB(read_bytes);
+    SUB(write_bytes);
+    SUB(cancelled_write_bytes);
+    SUB(nvcsw);
+    SUB(nivcsw);
+    SUB(ac_utimescaled);
+    SUB(ac_stimescaled);
+    SUB(cpu_scaled_run_real_total);
+    SUB(freepages_count);
+    SUB(freepages_delay_total);
+    #if TASKSTATS_VERSION == 10
+    SUB(thrashing_count);
+    SUB(thrashing_delay_total);
+    SUB(ac_btime64);
+    #endif
 }
 
-static void task_context_switch_counts(struct taskstats *t)
+//                CPU                     |                    IO                                   |  MEM                         |
+//    PID PPID USRus SYSus csw ncsw RUNdelay | r/s w/s rMB/s wMB/s rdMB/s wdMB/s IOdelay SWAPdelay  | minflt majflt FREEPAGESdelay | Command
+//time      10ms/1000=0.01ms
+
+#define FORMAT_CPU_header "%-6s %-6s %-8s %-8s %-6s %-6s %-20s"
+#define FORMAT_CPU        "%-6u %-6u %-8lu %-8lu %-6lu %-6lu %-20s"
+static void print_cpu_header()
 {
-	printf("\n\nTask   %15s%15s\n"
-	       "       %15llu%15llu\n",
-	       "voluntary", "nonvoluntary",
-	       (unsigned long long)t->nvcsw, (unsigned long long)t->nivcsw);
+    printf(FORMAT_CPU_header, "PID", "PPID", "USR(us)", "SYS(us)", "CSW", "NCSW", "RUNdelay(us)");
 }
+
+static void print_cpu(struct taskstats *t, long interval)
+{
+    char run_delay[256];
+    snprintf(run_delay, sizeof(run_delay), "%lu/%lu=%lu",
+                        t->cpu_delay_total/1000,
+                        t->cpu_count,
+                        t->cpu_count ? t->cpu_delay_total/1000/t->cpu_count : 0);
+    printf(FORMAT_CPU,  t->ac_pid,
+                        t->ac_ppid,
+                        t->ac_utime/1000,
+                        t->ac_stime/1000,
+                        t->nvcsw,
+                        t->nivcsw,
+                        run_delay);
+}
+
+#define FORMAT_IO_header "%-6s %-6s %-6s %-6s %-6s %-6s %-16s %-16s"
+#define FORMAT_IO        "%-6lu %-6lu %-6lu %-6lu %-6lu %-6lu %-16s %-16s"
+static void print_io_header()
+{
+    printf(FORMAT_IO_header, "r/s", "w/s", "rMB/s", "wMB/s", "rdMB/s", "wdMB/s", "IOdelay(us)", "SWAPdelay(us)");
+}
+
+static void print_io(struct taskstats *t, long interval)
+{
+    char io_delay[128];
+    char swap_delay[128];
+    snprintf(io_delay, sizeof(io_delay), "%lu/%lu=%lu",
+                        t->blkio_delay_total/1000,
+                        t->blkio_count,
+                        t->blkio_count ? t->blkio_delay_total/1000/t->blkio_count : 0);
+    snprintf(swap_delay, sizeof(swap_delay), "%lu/%lu=%lu",
+                        t->swapin_delay_total/1000,
+                        t->swapin_count,
+                        t->swapin_count ? t->swapin_delay_total/1000/t->swapin_count : 0);
+    printf(FORMAT_IO,   t->read_syscalls/interval,
+                        t->write_syscalls/interval,
+                        t->read_char/MB/interval,
+                        t->write_char/MB/interval,
+                        t->read_bytes/MB/interval,
+                        t->write_bytes/MB/interval,
+                        io_delay,
+                        swap_delay);
+}
+
+#define FORMAT_MEM_header "%-6s %-6s %-16s"
+#define FORMAT_MEM        "%-6lu %-6lu %-16s"
+static void print_mem_header()
+{
+    printf(FORMAT_MEM_header, "MINFLT", "MAJFLT", "FRPGdelay");
+}
+static void print_mem(struct taskstats *t, long interval)
+{
+    char freepages_delay[128];
+    snprintf(freepages_delay, sizeof(freepages_delay), "%lu/%lu=%lu",
+                        t->freepages_delay_total/1000,
+                        t->freepages_count,
+                        t->freepages_count ? t->freepages_delay_total/1000/t->freepages_count : 0);
+    printf(FORMAT_MEM,  t->ac_minflt, t->ac_majflt, freepages_delay);
+}
+
+
+static void print_comm_header()
+{
+    printf(" %s\n", "Command");
+}
+
+static void print_comm(struct taskstats *t)
+{
+    printf(" %s\n", t->ac_comm);
+}
+
 
 static void print_cgroupstats(struct cgroupstats *c)
 {
@@ -249,14 +464,23 @@ static void print_cgroupstats(struct cgroupstats *c)
 		(unsigned long long)c->nr_uninterruptible);
 }
 
-
-static void print_ioacct(struct taskstats *t)
+static void usage(void)
 {
-	printf("%s: read=%llu, write=%llu, cancelled_write=%llu\n",
-		t->ac_comm,
-		(unsigned long long)t->read_bytes,
-		(unsigned long long)t->write_bytes,
-		(unsigned long long)t->cancelled_write_bytes);
+	fprintf(stderr, "taskstats [-imav] [-C container] [-w logfile] [-r bufsize] [-t tgid] [-p pid] delay counts\n");
+	fprintf(stderr, "taskstats -l [-imav] -M cpumask filter\n");
+	fprintf(stderr, "  -l: listen forever\n");
+	fprintf(stderr, "  -i: print IO accounting\n");
+    fprintf(stderr, "  -m: print MEM accounting\n");
+    fprintf(stderr, "  -a: print all accounting\n");
+	fprintf(stderr, "  -v: debug on\n");
+	fprintf(stderr, "  -C: container path\n");
+    fprintf(stderr, "  -w: write to logfile\n");
+    fprintf(stderr, "  -r: recv buffer size\n");
+    fprintf(stderr, "  -t: filter tgid\n");
+    fprintf(stderr, "  -p: filter pid\n");
+    fprintf(stderr, "  delay: delay second\n");
+    fprintf(stderr, "  counts: counts\n");
+    fprintf(stderr, "  filter: filter task comm\n");
 }
 
 int main(int argc, char *argv[])
@@ -273,36 +497,38 @@ int main(int argc, char *argv[])
 	pid_t rtid = 0;
 
 	int fd = 0;
-	int count = 0;
+	long count = 0;
 	int write_file = 0;
 	int maskset = 0;
 	char *logfile = NULL;
-	int loop = 0;
+	int listen = 0;
 	int containerset = 0;
 	char *containerpath = NULL;
 	int cfd = 0;
 	int forking = 0;
 	sigset_t sigset;
+    int interval = 1, counts = 100000000;
+    char *filter = NULL;
+    struct taskstats *t;
+    struct taskstats dst, t1, t2;
 
 	struct msgtemplate msg;
 
 	while (!forking) {
-		c = getopt(argc, argv, "qdiw:r:m:t:p:vlC:c:");
+		c = getopt(argc, argv, "imaC:w:r:M:t:p:c:vl");
 		if (c < 0)
 			break;
 
 		switch (c) {
-		case 'd':
-			printf("print delayacct stats ON\n");
-			print_delays = 1;
-			break;
 		case 'i':
-			printf("printing IO accounting\n");
 			print_io_accounting = 1;
 			break;
-		case 'q':
-			printf("printing task/process context switch rates\n");
-			print_task_context_switch_counts = 1;
+		case 'm':
+			print_mem_accounting = 1;
+			break;
+        case 'a':
+			print_io_accounting = 1;
+            print_mem_accounting = 1;
 			break;
 		case 'C':
 			containerset = 1;
@@ -319,7 +545,7 @@ int main(int argc, char *argv[])
 			if (rcvbufsz < 0)
 				err(1, "Invalid rcv buf size\n");
 			break;
-		case 'm':
+		case 'M':
 			strncpy(cpumask, optarg, sizeof(cpumask));
 			cpumask[sizeof(cpumask) - 1] = '\0';
 			maskset = 1;
@@ -365,13 +591,35 @@ int main(int argc, char *argv[])
 			break;
 		case 'l':
 			printf("listen forever\n");
-			loop = 1;
+			listen = 1;
 			break;
 		default:
 			usage();
 			exit(-1);
 		}
 	}
+
+    if (!listen) {
+        if (!tid && !containerset) {
+            usage();
+            return -1;
+        }
+        if (tid && containerset) {
+            fprintf(stderr, "Select either -t or -C, not both\n");
+            return -1;
+        }
+        if (argc > optind)
+            interval = atoi(argv[optind]);
+        if (argc > optind + 1)
+            counts = atoi(argv[optind+1]);
+    } else {
+        if (!maskset) {
+            usage();
+            return -1;
+        }
+        if (argc > optind)
+            filter = strdup(argv[optind]);
+    }
 
 	if (write_file) {
 		fd = open(logfile, O_WRONLY | O_CREAT | O_TRUNC,
@@ -385,7 +633,6 @@ int main(int argc, char *argv[])
 	nl_sd = create_nl_socket(NETLINK_GENERIC);
 	if (nl_sd < 0)
 		err(1, "error creating Netlink socket\n");
-
 
 	mypid = getpid();
 	id = get_family_id(nl_sd);
@@ -406,11 +653,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (tid && containerset) {
-		fprintf(stderr, "Select either -t or -C, not both\n");
-		goto err;
-	}
-
 	/*
 	 * If we forked a child, wait for it to exit. Cannot use waitpid()
 	 * as all the delicious data would be reaped as part of the wait
@@ -420,35 +662,33 @@ int main(int argc, char *argv[])
 		sigwait(&sigset, &sig_received);
 	}
 
-	if (tid) {
-		rc = send_cmd(nl_sd, id, mypid, TASKSTATS_CMD_GET,
-			      cmd_type, &tid, sizeof(__u32));
-		PRINTF("Sent pid/tgid, retval %d\n", rc);
-		if (rc < 0) {
-			fprintf(stderr, "error sending tid/tgid cmd\n");
-			goto done;
-		}
-	}
-
-	if (containerset) {
-		cfd = open(containerpath, O_RDONLY);
-		if (cfd < 0) {
-			perror("error opening container file");
-			goto err;
-		}
-		rc = send_cmd(nl_sd, id, mypid, CGROUPSTATS_CMD_GET,
-			      CGROUPSTATS_CMD_ATTR_FD, &cfd, sizeof(__u32));
-		if (rc < 0) {
-			perror("error sending cgroupstats command");
-			goto err;
-		}
-	}
-	if (!maskset && !tid && !containerset) {
-		usage();
-		goto err;
-	}
-
 	do {
+        if (!listen) {
+            if (tid) {
+                rc = send_cmd(nl_sd, id, mypid, TASKSTATS_CMD_GET,
+                          cmd_type, &tid, sizeof(__u32));
+                PRINTF("Sent pid/tgid, retval %d\n", rc);
+                if (rc < 0) {
+                    fprintf(stderr, "error sending tid/tgid cmd\n");
+                    goto done;
+                }
+            }
+
+            if (containerset) {
+                cfd = open(containerpath, O_RDONLY);
+                if (cfd < 0) {
+                    perror("error opening container file");
+                    goto err;
+                }
+                rc = send_cmd(nl_sd, id, mypid, CGROUPSTATS_CMD_GET,
+                          CGROUPSTATS_CMD_ATTR_FD, &cfd, sizeof(__u32));
+                if (rc < 0) {
+                    perror("error sending cgroupstats command");
+                    goto err;
+                }
+            }
+        }
+
 		rep_len = recv(nl_sd, &msg, sizeof(msg), 0);
 		PRINTF("received %d bytes\n", rep_len);
 
@@ -467,7 +707,6 @@ int main(int argc, char *argv[])
 
 		PRINTF("nlmsghdr size=%zu, nlmsg_len=%d, rep_len=%d\n",
 		       sizeof(struct nlmsghdr), msg.n.nlmsg_len, rep_len);
-
 
 		rep_len = GENLMSG_PAYLOAD(&msg.n);
 
@@ -488,29 +727,44 @@ int main(int argc, char *argv[])
 					switch (na->nla_type) {
 					case TASKSTATS_TYPE_PID:
 						rtid = *(int *) NLA_DATA(na);
-						if (print_delays)
-							printf("PID\t%d\n", rtid);
+						//if (print_delays)
+						//	printf("PID\t%d\n", rtid);
 						break;
 					case TASKSTATS_TYPE_TGID:
 						rtid = *(int *) NLA_DATA(na);
-						if (print_delays)
-							printf("TGID\t%d\n", rtid);
+						//if (print_delays)
+						//	printf("TGID\t%d\n", rtid);
 						break;
 					case TASKSTATS_TYPE_STATS:
 						count++;
-						if (print_delays)
-							print_delayacct((struct taskstats *) NLA_DATA(na));
-						if (print_io_accounting)
-							print_ioacct((struct taskstats *) NLA_DATA(na));
-						if (print_task_context_switch_counts)
-							task_context_switch_counts((struct taskstats *) NLA_DATA(na));
-						if (fd) {
-							if (write(fd, NLA_DATA(na), na->nla_len) < 0) {
-								err(1,"write error\n");
-							}
-						}
-						if (!loop)
-							goto done;
+                        t = (struct taskstats *) NLA_DATA(na);
+                        if (count == 1) {
+                            print_cpu_header();
+                            if (print_io_accounting)
+                                print_io_header();
+                            if (print_mem_accounting)
+                                print_mem_header();
+                            print_comm_header();
+                        }
+                        if (!listen) {
+                            if (count > 1) {
+                                t2 = *t;
+                                taskstats_sub(&dst, &t1, &t2);
+                                t1 = *t;
+                                t = &dst;
+                            } else
+                                t = NULL;
+                        }
+                        if (t) {
+                            if (!filter || strncmp(t->ac_comm, filter, strlen(filter)) == 0) {
+                                print_cpu(t, interval);
+                                if (print_io_accounting)
+                                    print_io(t, interval);
+                                if (print_mem_accounting)
+                                    print_mem(t, interval);
+                                print_comm(t);
+                            }
+                        }
 						break;
 					case TASKSTATS_TYPE_NULL:
 						break;
@@ -537,7 +791,13 @@ int main(int argc, char *argv[])
 			}
 			na = (struct nlattr *) (GENLMSG_DATA(&msg) + len);
 		}
-	} while (loop);
+
+        if (!listen) {
+            sleep(interval);
+            if (--counts == 0)
+                break;
+        }
+	} while (1);
 done:
 	if (maskset) {
 		rc = send_cmd(nl_sd, id, mypid, TASKSTATS_CMD_GET,
