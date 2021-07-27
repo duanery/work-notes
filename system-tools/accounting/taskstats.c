@@ -480,7 +480,7 @@ static void print_cgroupstats(struct cgroupstats *c)
 
 static void usage(void)
 {
-    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-t tgid] [-p pid] delay counts\n");
+    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-t tid] [-p pid] delay counts\n");
     fprintf(stderr, "taskstats -l [-imavk] -M cpumask filter\n");
     fprintf(stderr, "  -l: listen forever\n");
     fprintf(stderr, "  -i: print IO accounting\n");
@@ -490,7 +490,7 @@ static void usage(void)
     fprintf(stderr, "  -C: container path\n");
     fprintf(stderr, "  -w: write to logfile\n");
     fprintf(stderr, "  -r: recv buffer size\n");
-    fprintf(stderr, "  -t: filter tgid\n");
+    fprintf(stderr, "  -t: filter thread id\n");
     fprintf(stderr, "  -p: filter pid\n");
     fprintf(stderr, "  -k: kbytes\n");
     fprintf(stderr, "  delay: delay second\n");
@@ -569,14 +569,14 @@ int main(int argc, char *argv[])
         case 't':
             tid = atoi(optarg);
             if (!tid)
-                err(1, "Invalid tgid\n");
-            cmd_type = TASKSTATS_CMD_ATTR_TGID;
+                err(1, "Invalid tid\n");
+            cmd_type = TASKSTATS_CMD_ATTR_PID;
             break;
         case 'p':
             tid = atoi(optarg);
             if (!tid)
                 err(1, "Invalid pid\n");
-            cmd_type = TASKSTATS_CMD_ATTR_PID;
+            cmd_type = TASKSTATS_CMD_ATTR_TGID;
             break;
         case 'c':
 
@@ -771,8 +771,10 @@ int main(int argc, char *argv[])
                                 taskstats_sub(&dst, &t1, &t2);
                                 t1 = *t;
                                 t = &dst;
-                            } else
+                            } else {
+                                t1 = *t;
                                 t = NULL;
+                            }
                         }
                         if (t) {
                             if (!filter || strncmp(t->ac_comm, filter, strlen(filter)) == 0) {
