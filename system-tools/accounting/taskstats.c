@@ -25,7 +25,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <signal.h>
-
+#include <time.h>
 #include <linux/genetlink.h>
 #include <linux/taskstats.h>
 #include <linux/cgroupstats.h>
@@ -41,6 +41,7 @@
 #define NLA_PAYLOAD(len)    (len - NLA_HDRLEN)
 
 #define MB (1024*1024)
+#define KB (1024)
 
 #define err(code, fmt, arg...)            \
     do {                    \
@@ -54,6 +55,7 @@ char name[100];
 int dbg;
 int print_io_accounting;
 int print_mem_accounting;
+int print_kbytes;
 
 #define PRINTF(fmt, arg...) {            \
         if (dbg) {                \
@@ -374,6 +376,15 @@ void taskstats_sub(struct taskstats *dst, struct taskstats *src1, struct tasksta
 //    PID PPID USRus SYSus csw ncsw RUNdelay | r/s w/s rMB/s wMB/s rdMB/s wdMB/s IOdelay SWAPdelay  | minflt majflt FREEPAGESdelay | Command
 //time      10ms/1000=0.01ms
 
+static void print_time()
+{
+    char timebuff[64];
+    time_t t = time(NULL);
+    strftime(timebuff, sizeof(timebuff), "%H:%M:%S", localtime(&t));
+    printf("%s ", timebuff);
+}
+
+
 #define FORMAT_CPU_header "%-6s %-6s %-8s %-8s %-6s %-6s %-20s"
 #define FORMAT_CPU        "%-6u %-6u %-8lu %-8lu %-6lu %-6lu %-20s"
 static void print_cpu_header()
@@ -401,7 +412,10 @@ static void print_cpu(struct taskstats *t, long interval)
 #define FORMAT_IO        "%-6lu %-6lu %-6lu %-6lu %-6lu %-6lu %-16s %-16s"
 static void print_io_header()
 {
-    printf(FORMAT_IO_header, "r/s", "w/s", "rMB/s", "wMB/s", "rdMB/s", "wdMB/s", "IOdelay(us)", "SWAPdelay(us)");
+    if (print_kbytes)
+        printf(FORMAT_IO_header, "r/s", "w/s", "rKB/s", "wKB/s", "rdKB/s", "wdKB/s", "IOdelay(us)", "SWAPdelay(us)");
+    else
+        printf(FORMAT_IO_header, "r/s", "w/s", "rMB/s", "wMB/s", "rdMB/s", "wdMB/s", "IOdelay(us)", "SWAPdelay(us)");
 }
 
 static void print_io(struct taskstats *t, long interval)
@@ -418,10 +432,10 @@ static void print_io(struct taskstats *t, long interval)
                         t->swapin_count ? t->swapin_delay_total/1000/t->swapin_count : 0);
     printf(FORMAT_IO,   t->read_syscalls/interval,
                         t->write_syscalls/interval,
-                        t->read_char/MB/interval,
-                        t->write_char/MB/interval,
-                        t->read_bytes/MB/interval,
-                        t->write_bytes/MB/interval,
+                        t->read_char/(print_kbytes?KB:MB)/interval,
+                        t->write_char/(print_kbytes?KB:MB)/interval,
+                        t->read_bytes/(print_kbytes?KB:MB)/interval,
+                        t->write_bytes/(print_kbytes?KB:MB)/interval,
                         io_delay,
                         swap_delay);
 }
@@ -466,8 +480,8 @@ static void print_cgroupstats(struct cgroupstats *c)
 
 static void usage(void)
 {
-    fprintf(stderr, "taskstats [-imav] [-C container] [-w logfile] [-r bufsize] [-t tgid] [-p pid] delay counts\n");
-    fprintf(stderr, "taskstats -l [-imav] -M cpumask filter\n");
+    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-t tgid] [-p pid] delay counts\n");
+    fprintf(stderr, "taskstats -l [-imavk] -M cpumask filter\n");
     fprintf(stderr, "  -l: listen forever\n");
     fprintf(stderr, "  -i: print IO accounting\n");
     fprintf(stderr, "  -m: print MEM accounting\n");
@@ -478,6 +492,7 @@ static void usage(void)
     fprintf(stderr, "  -r: recv buffer size\n");
     fprintf(stderr, "  -t: filter tgid\n");
     fprintf(stderr, "  -p: filter pid\n");
+    fprintf(stderr, "  -k: kbytes\n");
     fprintf(stderr, "  delay: delay second\n");
     fprintf(stderr, "  counts: counts\n");
     fprintf(stderr, "  filter: filter task comm\n");
@@ -515,7 +530,7 @@ int main(int argc, char *argv[])
     struct msgtemplate msg;
 
     while (!forking) {
-        c = getopt(argc, argv, "imaC:w:r:M:t:p:c:vl");
+        c = getopt(argc, argv, "imaC:w:r:M:t:p:c:vlk");
         if (c < 0)
             break;
 
@@ -592,6 +607,9 @@ int main(int argc, char *argv[])
         case 'l':
             printf("listen forever\n");
             listen = 1;
+            break;
+        case 'k':
+            print_kbytes = 1;
             break;
         default:
             usage();
@@ -739,6 +757,7 @@ int main(int argc, char *argv[])
                         count++;
                         t = (struct taskstats *) NLA_DATA(na);
                         if (count == 1) {
+                            print_time();
                             print_cpu_header();
                             if (print_io_accounting)
                                 print_io_header();
@@ -757,6 +776,7 @@ int main(int argc, char *argv[])
                         }
                         if (t) {
                             if (!filter || strncmp(t->ac_comm, filter, strlen(filter)) == 0) {
+                                print_time();
                                 print_cpu(t, interval);
                                 if (print_io_accounting)
                                     print_io(t, interval);
