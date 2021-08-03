@@ -480,7 +480,7 @@ static void print_cgroupstats(struct cgroupstats *c)
 
 static void usage(void)
 {
-    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-t tid] [-p pid] delay counts\n");
+    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-p pid] delay tids\n");
     fprintf(stderr, "taskstats -l [-imavk] -M cpumask filter\n");
     fprintf(stderr, "  -l: listen forever\n");
     fprintf(stderr, "  -i: print IO accounting\n");
@@ -490,18 +490,17 @@ static void usage(void)
     fprintf(stderr, "  -C: container path\n");
     fprintf(stderr, "  -w: write to logfile\n");
     fprintf(stderr, "  -r: recv buffer size\n");
-    fprintf(stderr, "  -t: filter thread id\n");
     fprintf(stderr, "  -p: filter pid\n");
     fprintf(stderr, "  -k: kbytes\n");
     fprintf(stderr, "  delay: delay second\n");
-    fprintf(stderr, "  counts: counts\n");
+    fprintf(stderr, "  tids: multiple thread ids\n");
     fprintf(stderr, "  filter: filter task comm\n");
 }
 
 int main(int argc, char *argv[])
 {
     int c, rc, rep_len, aggr_len, len2;
-    int cmd_type = TASKSTATS_CMD_ATTR_UNSPEC;
+    int cmd_type = TASKSTATS_CMD_ATTR_PID;
     __u16 id;
     __u32 mypid;
 
@@ -510,6 +509,9 @@ int main(int argc, char *argv[])
     int len = 0;
     pid_t tid = 0;
     pid_t rtid = 0;
+    pid_t *tids = NULL;
+    int   n_tids = 0;
+    int   c_tids = 0;
 
     int fd = 0;
     long count = 0;
@@ -525,7 +527,8 @@ int main(int argc, char *argv[])
     int interval = 1, counts = 100000000;
     char *filter = NULL;
     struct taskstats *t;
-    struct taskstats dst, t1, t2;
+    struct taskstats *t_tids = NULL;
+    struct taskstats dst, t2;
 
     struct msgtemplate msg;
 
@@ -566,16 +569,19 @@ int main(int argc, char *argv[])
             maskset = 1;
             printf("cpumask %s maskset %d\n", cpumask, maskset);
             break;
-        case 't':
-            tid = atoi(optarg);
-            if (!tid)
-                err(1, "Invalid tid\n");
-            cmd_type = TASKSTATS_CMD_ATTR_PID;
-            break;
+//        case 't':
+//            tid = atoi(optarg);
+//            if (!tid)
+//                err(1, "Invalid tid\n");
+//            cmd_type = TASKSTATS_CMD_ATTR_PID;
+//            break;
         case 'p':
             tid = atoi(optarg);
             if (!tid)
                 err(1, "Invalid pid\n");
+            n_tids = 1;
+            tids = &tid;
+            t_tids = &dst;
             cmd_type = TASKSTATS_CMD_ATTR_TGID;
             break;
         case 'c':
@@ -618,18 +624,31 @@ int main(int argc, char *argv[])
     }
 
     if (!listen) {
-        if (!tid && !containerset) {
-            usage();
-            return -1;
-        }
         if (tid && containerset) {
             fprintf(stderr, "Select either -t or -C, not both\n");
             return -1;
         }
-        if (argc > optind)
+        if (argc > optind) {
             interval = atoi(argv[optind]);
-        if (argc > optind + 1)
-            counts = atoi(argv[optind+1]);
+            optind ++;
+        }
+        if (argc > optind) {
+            int i;
+            n_tids = argc - optind;
+            tids = malloc(n_tids * sizeof(pid_t));
+            for (i = 0; i < n_tids; i++, optind++) {
+                tids[i] = atoi(argv[optind]);
+            }
+            tid = tids[0];
+            t_tids = malloc(n_tids * sizeof(struct taskstats));
+            if (!t_tids) {
+                fprintf(stderr, "alloc taskstats failed\n");
+                return -1;
+            }
+        } else if (!tid && !containerset) {
+            usage();
+            return -1;
+        }
     } else {
         if (!maskset) {
             usage();
@@ -766,13 +785,13 @@ int main(int argc, char *argv[])
                             print_comm_header();
                         }
                         if (!listen) {
-                            if (count > 1) {
+                            if (count > n_tids) {
                                 t2 = *t;
-                                taskstats_sub(&dst, &t1, &t2);
-                                t1 = *t;
-                                t = &dst;
+                                taskstats_sub(&t2, &t_tids[c_tids], t);
+                                t_tids[c_tids] = *t;
+                                t = &t2;
                             } else {
-                                t1 = *t;
+                                t_tids[c_tids] = *t;
                                 t = NULL;
                             }
                         }
@@ -814,6 +833,15 @@ int main(int argc, char *argv[])
             na = (struct nlattr *) (GENLMSG_DATA(&msg) + len);
         }
 
+        if (n_tids) {
+            c_tids ++;
+            if (c_tids != n_tids) {
+                tid = tids[c_tids];
+                continue;
+            }
+            c_tids = 0;
+            tid = tids[0];
+        }
         if (!listen) {
             sleep(interval);
             if (--counts == 0)
