@@ -380,7 +380,7 @@ static void print_time()
 {
     char timebuff[64];
     time_t t = time(NULL);
-    strftime(timebuff, sizeof(timebuff), "%H:%M:%S", localtime(&t));
+    strftime(timebuff, sizeof(timebuff), "%Y-%m-%d %H:%M:%S", localtime(&t));
     printf("%s ", timebuff);
 }
 
@@ -480,7 +480,7 @@ static void print_cgroupstats(struct cgroupstats *c)
 
 static void usage(void)
 {
-    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-p pid] delay tids\n");
+    fprintf(stderr, "taskstats [-imavk] [-C container] [-w logfile] [-r bufsize] [-p pid] delay tid [,tid...]\n");
     fprintf(stderr, "taskstats -l [-imavk] -M cpumask filter\n");
     fprintf(stderr, "  -l: listen forever\n");
     fprintf(stderr, "  -i: print IO accounting\n");
@@ -533,7 +533,7 @@ int main(int argc, char *argv[])
     struct msgtemplate msg;
 
     while (!forking) {
-        c = getopt(argc, argv, "imaC:w:r:M:t:p:c:vlk");
+        c = getopt(argc, argv, "imaC:w:r:M:t:p:c:vlkh");
         if (c < 0)
             break;
 
@@ -617,6 +617,7 @@ int main(int argc, char *argv[])
         case 'k':
             print_kbytes = 1;
             break;
+        case 'h':
         default:
             usage();
             exit(-1);
