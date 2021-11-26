@@ -401,8 +401,8 @@ static void print_cpu(struct taskstats *t, long interval)
                         t->cpu_count ? t->cpu_delay_total/1000/t->cpu_count : 0);
     printf(FORMAT_CPU,  t->ac_pid,
                         t->ac_ppid,
-                        t->ac_utime/1000,
-                        t->ac_stime/1000,
+                        t->ac_utime,
+                        t->ac_stime,
                         t->nvcsw,
                         t->nivcsw,
                         run_delay);
